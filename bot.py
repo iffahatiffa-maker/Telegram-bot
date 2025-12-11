@@ -1,189 +1,254 @@
-# bot.py
+#!/usr/bin/env python3
+"""
+bot.py - Telegram invite bot (python-telegram-bot v20 async)
+
+Features:
+- /start -> if not a member, shows "Request Invite" button
+- Per-user rate limit: max N invites per 7 days (Redis ZSET window)
+- createChatInviteLink with member_limit=1 and expire_date = now + INVITE_EXPIRE_SECONDS
+- Stores invite metadata in Redis (and optional sqlite for audit)
+- Webhook ready (USE_WEBHOOK=1). Polling fallback (USE_WEBHOOK=0) for local testing.
+"""
+
 import os
 import time
 import logging
-import asyncio
 import json
-from datetime import datetime, timedelta
+import asyncio
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
-from redis.asyncio import from_url as redis_from_url
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    CallbackQueryHandler,
-)
+from telegram.error import TelegramError
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+
+import redis.asyncio as aioredis
+import aiosqlite
 
 load_dotenv()
 
-# --- CONFIG ---
+# ---------------- CONFIG ----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_ID = os.getenv("GROUP_ID")  # numeric -100... or @groupusername
-REDIS_URL = os.getenv("REDIS_URL")  # redis://...
+GROUP_ID = os.getenv("GROUP_ID")
+REDIS_URL = os.getenv("REDIS_URL")
 USE_WEBHOOK = os.getenv("USE_WEBHOOK", "0") == "1"
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")  # e.g. https://<app>.up.railway.app
+WEBHOOK_BASE_URL = os.getenv("WEBHOOK_BASE_URL", "").rstrip("/")  # e.g. https://app.vercel.app
 PORT = int(os.getenv("PORT", "8080"))
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@privep2p")
-WEEK_SECONDS = 7 * 24 * 3600
+MAX_INVITES_PER_WEEK = int(os.getenv("MAX_INVITES_PER_WEEK", "2"))
+INVITE_EXPIRE_SECONDS = int(os.getenv("INVITE_EXPIRE_SECONDS", "3600"))
+DATABASE_PATH = os.getenv("DATABASE_PATH", "invites.db")
+# Redis keys: zset per user: invites:<user_id> with score = unix_ts
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN environment variable required")
-
+    raise RuntimeError("BOT_TOKEN env required")
 if not GROUP_ID:
-    raise RuntimeError("GROUP_ID environment variable required")
-
+    raise RuntimeError("GROUP_ID env required")
 if not REDIS_URL:
-    raise RuntimeError("REDIS_URL environment variable required")
+    raise RuntimeError("REDIS_URL env required")
 
-# --- Logging ---
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
-)
+# ---------------- logging ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# --- Redis client (async) ---
-redis = redis_from_url(REDIS_URL, decode_responses=True)
+# ---------------- redis client ----------------
+redis = aioredis.from_url(REDIS_URL, decode_responses=True)
 
-# keys usage:
-# inv_count:{user_id} -> integer (weekly counter, TTL ~7 days)
-# invite_meta:{invite_link} -> json with user_id, created_at, expire_ts
+# ---------------- sqlite init (optional audit) ----------------
+async def init_db(path: str):
+    try:
+        async with aiosqlite.connect(path) as db:
+            await db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS invites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    invite_link TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    expire_at INTEGER NOT NULL,
+                    used BOOLEAN DEFAULT 0,
+                    used_by INTEGER
+                );
+                """
+            )
+            await db.commit()
+    except Exception:
+        logger.exception("SQLite init failed")
 
-# --- Helpers ---
-async def can_send_invite(user_id: int) -> (bool, str):
+# ---------------- helper functions ----------------
+def redis_zkey_for_user(uid: int) -> str:
+    return f"invites:{uid}"
+
+async def cleanup_and_count_user(uid: int) -> int:
     """
-    Check if user can request an invite.
-    Returns (allowed, reason_message_if_not_allowed)
+    Remove entries older than 7 days and return current count.
+    Using ZSET: member = timestamp string, score = timestamp
     """
-    key = f"inv_count:{user_id}"
-    count = await redis.get(key)
-    count = int(count) if count else 0
-    if count >= 2:
-        return False, (
-            f"Limit reached — tumne is week me already {count} invites liye.\n"
-            f"Try next week, ya contact admin {ADMIN_USERNAME}."
-        )
-    return True, ""
+    key = redis_zkey_for_user(uid)
+    now = int(time.time())
+    cutoff = now - 7 * 24 * 3600
+    # remove old
+    await redis.zremrangebyscore(key, 0, cutoff)
+    count = await redis.zcard(key)
+    return int(count)
 
-async def record_invite(user_id: int, invite_link: str, expire_ts: int):
-    key = f"inv_count:{user_id}"
-    # INCR and set expiry to 7 days if new
-    new = await redis.incr(key)
-    ttl = await redis.ttl(key)
-    if ttl == -1:
-        await redis.expire(key, WEEK_SECONDS)
-    # store invite metadata
-    meta = {"user_id": user_id, "invite_link": invite_link, "created_at": int(time.time()), "expire_ts": expire_ts}
-    await redis.set(f"invite_meta:{invite_link}", json.dumps(meta), ex=3600 + 60)  # keep a bit longer than 1 hour
+async def add_invite_event(uid: int):
+    key = redis_zkey_for_user(uid)
+    now = int(time.time())
+    # use score=now, member = now:<random> to ensure uniqueness
+    member = f"{now}:{os.urandom(6).hex()}"
+    await redis.zadd(key, {member: now})
+    # ensure TTL so the set auto-expires if idle
+    await redis.expire(key, 7 * 24 * 3600 + 60)
 
-# --- Handlers ---
+async def store_invite_meta(invite_link: str, uid: int, expire_ts: int):
+    meta = {"user_id": uid, "invite_link": invite_link, "created_at": int(time.time()), "expire_ts": expire_ts}
+    await redis.set(f"invite_meta:{invite_link}", json.dumps(meta), ex=INVITE_EXPIRE_SECONDS + 300)
+
+async def save_invite_sql(uid: int, link: str, created_at: int, expire_at: int):
+    try:
+        async with aiosqlite.connect(DATABASE_PATH) as db:
+            await db.execute(
+                "INSERT INTO invites (user_id, invite_link, created_at, expire_at) VALUES (?, ?, ?, ?)",
+                (uid, link, created_at, expire_at),
+            )
+            await db.commit()
+    except Exception:
+        logger.exception("Failed to write to sqlite")
+
+# ---------------- command handlers ----------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    chat_type = update.effective_chat.type
-    # We want people to request invite if they are not members of the group
-    # Try to check membership using get_chat_member - might raise if bot not in group/permissions
+    if user is None:
+        return
+    uid = user.id
+    # Check membership
     is_member = False
     try:
-        # If GROUP_ID is like "@mygroup" it's okay; else numeric
-        member = await context.bot.get_chat_member(GROUP_ID, user.id)
-        status = member.status  # 'member', 'creator', 'administrator', 'left', 'kicked'
-        if status in ("member", "creator", "administrator"):
+        m = await context.bot.get_chat_member(GROUP_ID, uid)
+        status = getattr(m, "status", "")
+        if status in ("member", "administrator", "creator"):
             is_member = True
-    except Exception as e:
-        # If bot can't check, assume not member
-        logger.debug("Failed to fetch chat member: %s", e)
-        is_member = False
+    except TelegramError as e:
+        # if bot lacks rights or can't fetch, assume not member
+        logger.debug("get_chat_member failed: %s", e)
 
     if is_member:
-        await update.message.reply_text(
-            f"Hello {user.first_name}! You're already a member of the group. Use the bot features from inside the group."
-        )
+        await update.message.reply_text(f"✅ Namaste {user.first_name}! You are already a member of the group.")
         return
 
-    # Not a member -> send invite request button
     text = (
-        "You are not a member of the group.\n"
-        f"Contact admin {ADMIN_USERNAME} if urgent.\n\n"
+        "❗ You are not a member of the group.\n"
+        f"Contact admin: {ADMIN_USERNAME}\n\n"
         "Click below to request a one-time invite link (1 hour expiry, single use)."
     )
-    kb = InlineKeyboardMarkup.from_button(
-        InlineKeyboardButton("Request Invite", callback_data="request_invite")
-    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Request Invite 🔗", callback_data="request_invite")]])
     await update.message.reply_text(text, reply_markup=kb)
 
 async def request_invite_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()  # acknowledge callback
+    if query is None:
+        return
+    await query.answer()
     user = update.effective_user
-    user_id = user.id
+    uid = user.id
 
-    allowed, reason = await can_send_invite(user_id)
-    if not allowed:
-        await query.edit_message_text(reason)
+    # rate-limit check
+    try:
+        count = await cleanup_and_count_user(uid)
+    except Exception:
+        logger.exception("Redis error")
+        await query.edit_message_text("Server error (redis). Try again later.")
         return
 
-    # Try to create invite link
-    now = int(time.time())
-    expire_ts = now + 3600  # 1 hour
-    try:
-        invite = await context.bot.create_chat_invite_link(chat_id=GROUP_ID, expire_date=expire_ts, member_limit=1)
-        link = invite.invite_link
-    except Exception as e:
-        logger.exception("Failed creating invite: %s", e)
+    if count >= MAX_INVITES_PER_WEEK:
         await query.edit_message_text(
-            f"Sorry, couldn't create invite link. Contact admin {ADMIN_USERNAME}.\nError: {e}"
+            f"⚠️ Tumne is hafte already {count} invites use kar liye hain. Agla invite next week try karo.\nContact admin: {ADMIN_USERNAME}"
         )
         return
 
-    # record in redis
-    await record_invite(user_id, link, expire_ts)
+    # create invite link
+    now = int(time.time())
+    expire_ts = now + INVITE_EXPIRE_SECONDS
+    try:
+        invite = await context.bot.create_chat_invite_link(
+            chat_id=GROUP_ID,
+            expire_date=expire_ts,
+            member_limit=1,
+            name=f"Invite for {uid}"
+        )
+        link = invite.invite_link
+    except TelegramError as e:
+        logger.exception("createChatInviteLink failed")
+        await query.edit_message_text(f"❗ Bot cannot create invite (needs admin rights). Contact admin {ADMIN_USERNAME}.")
+        return
+    except Exception:
+        logger.exception("createChatInviteLink unexpected")
+        await query.edit_message_text(f"❗ Something went wrong creating invite. Contact admin {ADMIN_USERNAME}.")
+        return
 
-    # Send invite with join button
-    kb = InlineKeyboardMarkup.from_button(
-        InlineKeyboardButton("Join Group", url=link)
-    )
-    sent_text = (
-        "Here's your invite link — single use, expires in 1 hour.\n\n"
-        "Click **Join Group** to join now."
-    )
-    await query.edit_message_text(sent_text, parse_mode=ParseMode.MARKDOWN, reply_markup=kb)
+    # record
+    await add_invite_event(uid)
+    await store_invite_meta(link, uid, expire_ts)
+    # optional sqlite audit
+    try:
+        await save_invite_sql(uid, link, now, expire_ts)
+    except Exception:
+        logger.debug("sqlite save skipped")
 
-async def health_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Bot is alive.")
+    # send invite
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Join Group ✅", url=link)]])
+    sent_text = "🔗 Yeh tumhara invite link (single-use). Expire ho jayega 1 hour me.\n\nClick below to join now."
+    await query.edit_message_text(sent_text, reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
 
-# --- Main boot ---
+async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("/start - request invite\n/status - remaining invites this week")
+
+async def status_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    try:
+        count = await cleanup_and_count_user(user.id)
+        remain = max(0, MAX_INVITES_PER_WEEK - count)
+        await update.message.reply_text(f"You have {remain} invites left this 7-day window.")
+    except Exception:
+        await update.message.reply_text("Error checking status.")
+
+# ---------------- startup ----------------
 def build_app():
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
-    app.add_handler(CommandHandler("start", start_handler))
-    app.add_handler(CommandHandler("health", health_handler))
-    app.add_handler(CallbackQueryHandler(request_invite_cb, pattern="^request_invite$"))
-    return app
+    return ApplicationBuilder().token(BOT_TOKEN).build()
 
 async def main():
-    application = build_app()
-    # set webhook if requested
+    # init redis and sqlite
+    try:
+        await redis.ping()
+    except Exception:
+        logger.exception("Cannot connect to Redis - check REDIS_URL")
+        raise
+
+    await init_db(DATABASE_PATH)
+
+    app = build_app()
+    app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("help", help_handler))
+    app.add_handler(CommandHandler("status", status_handler))
+    app.add_handler(CallbackQueryHandler(request_invite_cb, pattern="^request_invite$"))
+
     if USE_WEBHOOK:
-        if not WEBHOOK_URL:
-            raise RuntimeError("WEBHOOK_URL required when USE_WEBHOOK=1")
+        if not WEBHOOK_BASE_URL:
+            raise RuntimeError("WEBHOOK_BASE_URL required when USE_WEBHOOK=1")
         webhook_path = f"/webhook/{BOT_TOKEN}"
-        webhook_full = f"{WEBHOOK_URL}{webhook_path}"
+        webhook_full = f"{WEBHOOK_BASE_URL}{webhook_path}"
         logger.info("Setting webhook to %s", webhook_full)
-        # set webhook via bot
-        await application.bot.set_webhook(webhook_full)
-        # run webhook (this blocks)
-        # Use run_webhook helper (it creates aiohttp app)
-        await application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            path=webhook_path,
-            webhook_url=webhook_full,
-        )
+        # set webhook (bot must be able to reach this URL)
+        await app.bot.set_webhook(webhook_full)
+        # run webhook server
+        await app.run_webhook(listen="0.0.0.0", port=PORT, webhook_path=webhook_path, webhook_url=webhook_full)
     else:
-        # polling mode (not recommended for production), but fallback
         logger.info("Starting polling (USE_WEBHOOK=0)")
-        await application.run_polling()
+        await app.run_polling()
 
 if __name__ == "__main__":
     try:
